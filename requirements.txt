@@ -1,0 +1,5 @@
+# PyGObject is deliberately not listed here: building it from pip requires a
+# large toolchain, and the distribution package (python3-gi) is what actually
+# matches the installed GTK. See install.sh / the README.
+python-rtmidi>=1.5
+pulsectl>=23.5
