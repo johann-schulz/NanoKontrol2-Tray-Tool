@@ -1,6 +1,6 @@
 # nanokontrol-daemon
 
-Turn a Korg nanoKONTROL2 into a hardware volume mixer for PipeWire/PulseAudio on Linux.
+Turn a Korg nanoKONTROL2 into a hardware volume mixer for PipeWire/PulseAudio on **Linux**.
 Faders and knobs control per-application volumes or audio devices, the mute buttons mute
 whatever their fader controls, and the transport buttons drive a media player over MPRIS.
 
@@ -8,6 +8,8 @@ The reason this exists: every other tool I tried ignored the one problem that ac
 matters in daily use — **Spotify resets its own stream volume on every track change and
 every seek**, which throws away whatever you set with the fader. This daemon handles that
 without a polling loop, and idles at essentially zero CPU.
+
+Note that this project is purely AI-generated. Anyway, it works flawlessly on my machine ;)
 
 ## Features
 
