@@ -1,8 +1,13 @@
 # nanokontrol-daemon
 
-Turn a Korg nanoKONTROL2 into a hardware volume mixer for PipeWire/PulseAudio on **Linux**.
+Turn a Korg nanoKONTROL2 into a hardware volume mixer for PipeWire/PulseAudio on **Linux** —
+and, with a separate port in [`windows/`](windows), for **Windows 11**.
 Faders and knobs control per-application volumes or audio devices, the mute buttons mute
-whatever their fader controls, and the transport buttons drive a media player over MPRIS.
+whatever their fader controls, and the transport buttons drive a media player over MPRIS
+(on Windows: the Windows media controls).
+
+Windows users: everything you need is in the [Windows](#windows) section; the rest of this
+README up to it describes the Linux version.
 
 The reason this exists: every other tool I tried ignored the one problem that actually
 matters in daily use — **Spotify resets its own stream volume on every track change and
@@ -24,6 +29,8 @@ Note that this project is purely AI-generated. Anyway, it works flawlessly on my
 - Reconnects on its own when PipeWire restarts
 
 ## Requirements
+
+For the Windows version see [Windows](#windows).
 
 - Linux with PipeWire (via `pipewire-pulse`) or PulseAudio
 - Python 3.9+
@@ -184,6 +191,128 @@ it is running. Flatpak and Snap builds sometimes register under a different bus 
 
 ---
 
+# Windows
+
+`windows/nanokontrol-windows.py` is a port of the daemon to Windows 11 with the same
+controls, the same tray-driven configuration and the same config format. It is built to run
+unattended for months: unplugging and replugging the controller, standby, changing the
+default device or restarting applications need no restart and no reconfiguration.
+
+## Requirements
+
+- Windows 11 (Windows 10 should work, but is untested)
+- Python 3.11+ from [python.org](https://www.python.org/downloads/windows/). No compiler is
+  needed — every dependency ships prebuilt wheels, and MIDI is read through the Windows MIDI
+  API directly, so there is no `python-rtmidi` dependency.
+- No other program may hold the nanoKONTROL2 MIDI port (quit e.g. NK2Tray and remove it from
+  autostart).
+
+## Installation
+
+```powershell
+git clone https://github.com/johann-schulz/NanoKontrol2-Tray-Tool.git
+cd NanoKontrol2-Tray-Tool
+powershell -ExecutionPolicy Bypass -File .\windows\install.ps1
+```
+
+The script installs the Python packages from `windows/requirements.txt` for the current
+user, copies the script to `%LOCALAPPDATA%\nanokontrol`, creates an autostart shortcut
+(started windowless via `pythonw.exe`) and starts the mixer. It is safe to re-run — a
+running instance is stopped and replaced — and never touches an existing configuration.
+
+- `install.ps1 -NoAutostart` — install without the autostart shortcut
+- `install.ps1 -NoStart` — do not start it at the end
+- `install.ps1 -Uninstall` — stop it, remove the shortcut and the installed script
+  (configuration and Python packages are kept)
+
+To try it without installing, run it from the checkout in a console:
+
+```powershell
+pip install -r windows\requirements.txt
+python windows\nanokontrol-windows.py --no-supervisor
+```
+
+`--midi-test` only logs the incoming control changes, `--debug` logs verbosely.
+
+## Usage
+
+Left-click the tray icon for the settings window, right-click for the menu:
+
+- **Mute: \<target\>** — one checkbox per assigned fader, mirroring the mute state
+- **Settings …** — the assignment window, the same as on Linux
+- **Rescan / reconnect devices** — forces a fresh look at MIDI and audio; normally not needed
+- **Open config folder** — config, state and log files
+- **Quit**
+
+The icon turns grey with a red dot while the controller is not connected or the audio system
+is unavailable; the tooltip and the top of the menu say which.
+
+Differences to the Linux version:
+
+| | Linux | Windows |
+| --- | --- | --- |
+| Application names | `application.name` (`Spotify`) | process name as in Task Manager › Details (`Spotify.exe`) |
+| Devices | sink/source names | endpoint ids, plus the remembered device name |
+| Transport | MPRIS via `playerctl` | Windows media controls |
+| Player lock | MPRIS name (`spotify`) | part of the player's app id (`Spotify`), case-insensitive |
+| Config | `~/.config/nanokontrol/` | `%APPDATA%\nanokontrol\` |
+| Autostart | systemd user service | shortcut in the Startup folder + built-in supervisor |
+
+Application names match case-insensitively and with or without `.exe`, so a config copied
+from Linux keeps working. If the player lock is empty, the transport buttons go to whatever
+Windows considers the current player; if nothing is registered there, plain media keys are
+sent. If it is set and that player is not running, the buttons do nothing — just like on
+Linux.
+
+Defaults on first start: faders 1–3 control `Spotify.exe`, `firefox.exe` and `Discord.exe`,
+fader 8 is the default output, knob 8 is the default input, transport is locked to Spotify.
+
+### Configuration files
+
+`%APPDATA%\nanokontrol\config.json` has the same layout as on Linux, plus:
+
+```json
+{
+  "device_labels": {"{0.0.0.00000000}.{…}": "Headset (USB Audio)"},
+  "midi_port": "nanoKONTROL2",
+  "midi_idle_reopen_minutes": 15
+}
+```
+
+- `device_labels` — names of assigned devices, written by the settings window, so an
+  unplugged device is still shown by name and is found again if Windows gives it a new id
+- `midi_port` — substring of the MIDI input port name
+- `midi_idle_reopen_minutes` — re-open an idle MIDI port this often as a last line of
+  defence against a silently dead handle; `0` disables it
+
+`state.json` is the same as on Linux. Both files are written atomically, and the previous
+valid version is kept as `.bak`. A damaged file is never silently replaced by defaults: it is
+copied aside as `.broken-<timestamp>` and the backup is loaded instead. Assignments are never
+dropped because an application is not running or a device is unplugged — the settings
+window lists them as *currently unavailable* and they work again once it is back.
+
+`nanokontrol.log` (service) and `supervisor.log` live in the same folder, rotated at 1 MB.
+
+## Troubleshooting
+
+**Icon stays grey, tooltip says the port is in use.** Another program holds the MIDI port —
+usually a previous mixer tool. Quit it; the port is picked up within a second.
+
+**Icon stays grey, controller not found.** Check the port name in Device Manager or with
+`--midi-test`. If it does not contain `nanoKONTROL2`, set `midi_port` in `config.json`.
+
+**An application ignores its fader.** The name must match its process name. Start it, open
+the settings window — running applications are marked *(playing)* — and pick it from there.
+
+**Transport buttons control the wrong player or nothing.** Open the settings window while the
+player runs; the *Media player* list shows the app ids Windows reports. Any part of the id
+works, e.g. `Spotify` for both the desktop and the Store version.
+
+**It does not start at all.** A message box points to the log. Missing packages are fixed by
+running `install.ps1` again.
+
+---
+
 # Developer notes
 
 ## MIDI mapping
@@ -299,15 +428,64 @@ Any `sink` or `source` event clears the cache; the next access re-resolves via
 `get_sink_by_name()`. Without this, unplugging and replugging an interface leaves the daemon
 writing to a dead index.
 
+## Windows port
+
+The Windows version keeps the Linux design where Windows allows it and differs where it
+does not:
+
+| Thread | Job |
+| --- | --- |
+| main | Qt event loop, tray, settings window |
+| audio | Owns every Core Audio COM object; applies fader commands, reconciles once a second |
+| midi | Owns the WinMM port; messages arrive in its own message queue (`CALLBACK_THREAD`) |
+| media | asyncio loop for the Windows media controls |
+| save | Debounced writes of `state.json` |
+| watchdog | Detects standby (wall clock jumps) and hung threads |
+
+**Reconciling instead of event subscription.** Windows offers COM callbacks for new sessions
+and volume changes, but they run on threads of the audio service and are a common source of
+crashes in Python. The audio thread instead re-reads devices and sessions once a second and
+corrects whatever deviates. That costs a few COM calls per second, and nothing is lost by it:
+Windows itself remembers the volume of every application, so a newly created session already
+starts at the level last set — the job stream-restore does on Linux. Fader moves are applied
+immediately and coalesced, so dragging a fader is one write per target per batch.
+
+**One owner per resource.** All COM objects live in the audio thread (multi-threaded
+apartment), so nothing is marshalled and the Qt thread never touches them. The MIDI and UI
+threads only put commands into a queue. Worker threads publish a plain snapshot (devices,
+running applications, mute states) that the UI reads.
+
+**MIDI without a driver callback.** The WinMM port is opened with `CALLBACK_THREAD`: input
+arrives as messages in the MIDI thread's queue, so no driver thread ever calls into Python.
+The port list is checked every second; any change (unplug, replug, another MIDI device
+shifting the indices), a close reported by the driver or a resume from standby leads to a
+clean re-open. While the port is absent or busy, opening is simply retried.
+
+**Devices by id, then by name.** Endpoint ids are stable, but a device plugged into another
+USB port can get a new one. If an assigned id is gone, the device is looked up by its
+remembered name, as long as that is unambiguous. Invalidated interfaces are re-activated
+once before the whole audio state is rebuilt.
+
+**Layers of recovery.** Every worker runs in a supervised thread that is restarted when it
+dies. A watchdog ends the process if one of them stops reporting in for 90 s, and the
+default launch mode is a small supervisor process that restarts the service on any abnormal
+exit, with back-off. A clean *Quit* ends both. Named mutexes keep a second instance from
+fighting over the MIDI port. On exit, interpreter teardown is skipped (`os._exit`) after the
+state is saved, which avoids the classic crashes of COM objects being released too late.
+
 ## Known limitations
 
 - Application matching is by `application.name` (falling back to
   `application.process.binary`), so two applications reporting the same name share a fader.
 - No soft-takeover, see above.
-- MIDI hot-plug is not handled; the port is opened once at startup.
+- Linux: MIDI hot-plug is not handled; the port is opened once at startup. (The Windows
+  version re-acquires the port on its own.)
+- Windows: applications are matched by process name, so all processes of the same name share
+  a fader; Windows system sounds cannot be assigned.
 - UI strings are hardcoded English, no gettext.
-- Only tested on Ubuntu with PipeWire and GNOME. The PulseAudio API used is the compatibility
-  layer, so real PulseAudio should work, but it is untested.
+- Linux: only tested on Ubuntu with PipeWire and GNOME. The PulseAudio API used is the
+  compatibility layer, so real PulseAudio should work, but it is untested.
+- Windows: only tested on Windows 11.
 
 ## License
 

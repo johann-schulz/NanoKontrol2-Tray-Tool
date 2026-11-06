@@ -101,6 +101,9 @@ EXIT_HANG = 2            # watchdog fired -> restart
 EXIT_FATAL = 3           # missing dependency etc. -> do not restart
 EXIT_ALREADY_RUNNING = 4  # another service process holds the lock
 
+# Identifies our windows to the taskbar, see run_ui().
+APP_USER_MODEL_ID = 'nanokontrol2.mixer.windows'
+
 # --- Paths ---
 CONFIG_DIR = os.path.join(
     os.environ.get('APPDATA') or os.path.expanduser('~'), 'nanokontrol')
@@ -1246,24 +1249,31 @@ def run_ui():
         changed = Signal()
 
     def make_icon(healthy):
-        pixmap = QPixmap(64, 64)
-        pixmap.fill(Qt.GlobalColor.transparent)
-        painter = QPainter(pixmap)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor('#2d2d2d'))
-        painter.drawRoundedRect(2, 2, 60, 60, 12, 12)
-        knob = QColor('#4fc3f7' if healthy else '#9e9e9e')
-        for x, y in ((16, 38), (32, 20), (48, 44)):
-            painter.setBrush(QColor('#8a8a8a'))
-            painter.drawRect(x - 2, 10, 4, 44)
-            painter.setBrush(knob)
-            painter.drawRoundedRect(x - 8, y - 5, 16, 10, 3, 3)
-        if not healthy:
-            painter.setBrush(QColor('#e53935'))
-            painter.drawEllipse(38, 38, 24, 24)
-        painter.end()
-        return QIcon(pixmap)
+        """Drawn in code, so no image file has to be shipped. Rendered at
+        several sizes so it stays sharp in the tray, the taskbar and on
+        high-DPI screens. Drawing coordinates are on a 64x64 grid."""
+        icon = QIcon()
+        for size in (16, 24, 32, 48, 64, 128, 256):
+            pixmap = QPixmap(size, size)
+            pixmap.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(pixmap)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.scale(size / 64.0, size / 64.0)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor('#2d2d2d'))
+            painter.drawRoundedRect(2, 2, 60, 60, 12, 12)
+            knob = QColor('#4fc3f7' if healthy else '#9e9e9e')
+            for x, y in ((16, 38), (32, 20), (48, 44)):
+                painter.setBrush(QColor('#8a8a8a'))
+                painter.drawRect(x - 2, 10, 4, 44)
+                painter.setBrush(knob)
+                painter.drawRoundedRect(x - 8, y - 5, 16, 10, 3, 3)
+            if not healthy:
+                painter.setBrush(QColor('#e53935'))
+                painter.drawEllipse(38, 38, 24, 24)
+            painter.end()
+            icon.addPixmap(pixmap)
+        return icon
 
     class SettingsWindow(QWidget):
         def __init__(self, tray_app):
@@ -1520,11 +1530,22 @@ def run_ui():
             shutdown.set()
             self.app.quit()
 
+    # Without an own AppUserModelID, Windows groups our windows under
+    # pythonw.exe and shows the Python icon in the taskbar instead of ours.
+    if IS_WINDOWS:
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                ctypes.c_wchar_p(APP_USER_MODEL_ID))
+        except (OSError, AttributeError) as err:
+            log.warning("could not set the AppUserModelID: %s", err)
+
     app = QApplication(sys.argv[:1])
     app.setApplicationName("nanoKONTROL2")
     app.setQuitOnLastWindowClosed(False)
 
     tray_app = TrayApp(app)
+    # Default icon for every window, dialogs included (taskbar, Alt+Tab).
+    app.setWindowIcon(tray_app.icon_ok)
     bridge = Bridge()
     bridge.changed.connect(tray_app.update_status)
     # Emitting a signal is thread safe; Qt delivers it on the GUI thread.
