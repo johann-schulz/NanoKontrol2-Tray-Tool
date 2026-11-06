@@ -90,6 +90,14 @@ function Find-Python {
 
 if ($env:OS -ne 'Windows_NT') { Die "this installer is for Windows; on Linux use ./install.sh" }
 
+# Anything not bound to a switch above ends up in $args. Without this check a
+# mistyped option (e.g. "Uninstall" without the dash) would silently run a
+# normal installation instead.
+if ($args.Count -gt 0) {
+    Die ("unknown argument(s): $($args -join ' ')`n" +
+         "        options are -Uninstall, -NoAutostart, -NoStart (note the leading dash)")
+}
+
 # --- Uninstall ---------------------------------------------------------------
 
 if ($Uninstall) {
