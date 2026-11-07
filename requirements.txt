@@ -3,3 +3,4 @@
 # matches the installed GTK. See install.sh / the README.
 python-rtmidi>=1.5
 pulsectl>=23.5
+sounddevice>=0.4.6     # speaker keep-alive (needs libportaudio2)

@@ -5,6 +5,7 @@ pycaw>=20240210            # Windows Core Audio: per-app and device volumes
 comtypes>=1.2
 psutil>=5.9                # process names of audio sessions
 PySide6-Essentials>=6.5    # tray icon and settings window (QtCore/Gui/Widgets only)
+sounddevice>=0.4.6         # speaker keep-alive (ships PortAudio on Windows)
 # Windows media controls for the transport buttons (player selection).
 # Optional at runtime: without them, plain media keys are sent instead.
 winrt-runtime>=2.0

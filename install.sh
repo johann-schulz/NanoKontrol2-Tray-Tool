@@ -30,6 +30,7 @@ APT_PACKAGES=(
     python3-gi           # tray icon and settings window
     gir1.2-gtk-3.0
     gir1.2-ayatanaappindicator3-0.1
+    libportaudio2        # audio output of the speaker keep-alive
 )
 
 info()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
@@ -87,6 +88,7 @@ else
     warn "No apt-get found. Install these yourself, however your distribution names them:"
     warn "  playerctl, python3-pip, alsa-lib headers, pkg-config,"
     warn "  PyGObject, GTK 3 introspection data, AyatanaAppIndicator3 introspection data"
+    warn "  PortAudio (libportaudio2)"
 fi
 
 # --- Python packages ---------------------------------------------------------

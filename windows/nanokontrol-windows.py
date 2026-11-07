@@ -27,6 +27,7 @@ Config lives in %APPDATA%\\nanokontrol\\{config,state}.json.
 """
 
 import argparse
+import array
 import asyncio
 import copy
 import ctypes
@@ -34,6 +35,7 @@ import importlib.util
 import json
 import logging
 import logging.handlers
+import math
 import os
 import queue
 import shutil
@@ -101,6 +103,85 @@ EXIT_HANG = 2            # watchdog fired -> restart
 EXIT_FATAL = 3           # missing dependency etc. -> do not restart
 EXIT_ALREADY_RUNNING = 4  # another service process holds the lock
 
+# --- Speaker keep-alive ------------------------------------------------------
+#
+# Some active speakers fall into standby during quiet passages and wake up
+# again with a crackle. A short, inaudible burst every few minutes keeps them
+# awake. Between bursts no audio stream is open and the thread just sleeps;
+# the tone itself is computed once per settings change.
+
+KEEPALIVE_DEFAULTS = {
+    "enabled": False,
+    "interval_minutes": 10.0,     # time from the start of one burst to the next
+    "duration_s": 2.0,            # length of one burst
+    "frequency_hz": 20000.0,
+    "level_dbfs": -30.0,          # 0 = full scale
+    "sample_rate": 48000,
+    "fade_s": 0.05,               # fade in/out against clicks
+    "pause_when_locked": False,
+}
+KEEPALIVE_SAMPLE_RATES = (44100, 48000, 88200, 96000)
+# key -> (minimum, maximum); frequency is further limited to below Nyquist
+KEEPALIVE_LIMITS = {
+    "interval_minutes": (0.5, 240.0),
+    "duration_s": (0.1, 60.0),
+    "frequency_hz": (10.0, 48000.0),
+    "level_dbfs": (-90.0, 0.0),
+    "fade_s": (0.0, 5.0),
+}
+
+
+def keepalive_problem(settings):
+    """Human readable reason why the settings cannot work, or None."""
+    nyquist = settings['sample_rate'] / 2
+    if settings['frequency_hz'] >= nyquist:
+        return ("The frequency must be below half the sample rate (%.0f Hz). "
+                "Lower it or raise the sample rate." % nyquist)
+    if settings['duration_s'] >= settings['interval_minutes'] * 60:
+        return "The burst must be shorter than the interval."
+    return None
+
+
+def normalize_keepalive(raw):
+    """Defaults for everything missing or invalid, numbers clamped to their
+    limits. Never raises, whatever is in the file."""
+    settings = dict(KEEPALIVE_DEFAULTS)
+    if not isinstance(raw, dict):
+        return settings
+    for key in ('enabled', 'pause_when_locked'):
+        if isinstance(raw.get(key), bool):
+            settings[key] = raw[key]
+    for key, (low, high) in KEEPALIVE_LIMITS.items():
+        value = raw.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value == value:
+            settings[key] = float(min(max(value, low), high))
+    if raw.get('sample_rate') in KEEPALIVE_SAMPLE_RATES:
+        settings['sample_rate'] = int(raw['sample_rate'])
+    if keepalive_problem(settings):
+        # Inconsistent combination (hand edited file): fall back to the
+        # defaults for the dependent values rather than refusing to start.
+        for key in ('frequency_hz', 'sample_rate', 'duration_s', 'interval_minutes'):
+            settings[key] = KEEPALIVE_DEFAULTS[key]
+    return settings
+
+
+def build_keepalive_tone(settings):
+    """Mono float32 sine with linear fade-in/out, as raw bytes."""
+    rate = settings['sample_rate']
+    count = int(settings['duration_s'] * rate)
+    amplitude = 10 ** (settings['level_dbfs'] / 20.0)
+    step = 2 * math.pi * settings['frequency_hz'] / rate
+    samples = array.array('f', (amplitude * math.sin(step * i) for i in range(count)))
+    # Fades never exceed half the tone length.
+    fade = min(int(settings['fade_s'] * rate), count // 2)
+    if fade > 1:
+        for i in range(fade):
+            gain = i / (fade - 1)
+            samples[i] *= gain
+            samples[count - 1 - i] *= gain
+    return samples.tobytes()
+
+
 # Identifies our windows to the taskbar, see run_ui().
 APP_USER_MODEL_ID = 'nanokontrol2.mixer.windows'
 
@@ -136,6 +217,8 @@ DEFAULT_CONFIG = {
     # re-open an idle MIDI port this often as a last line of defence against
     # handles that died silently; 0 disables it
     "midi_idle_reopen_minutes": 15,
+    # speaker keep-alive, see KEEPALIVE_DEFAULTS
+    "keepalive": dict(KEEPALIVE_DEFAULTS),
 }
 
 log = logging.getLogger('nanokontrol')
@@ -164,12 +247,14 @@ runtime = {
     'devices': {'sink': {}, 'source': {}},   # kind -> {device id: label}
     'defaults': {'sink': None, 'source': None},
     'device_mutes': {},             # device target -> bool
+    'keepalive_status': 'off',
 }
 
 heartbeats = {}                     # thread name -> monotonic timestamp
 args = None
 midi_input = None
 media = None
+keepalive = None
 
 
 def notify_ui():
@@ -364,6 +449,7 @@ def load_config():
         minutes = stored.get('midi_idle_reopen_minutes')
         if isinstance(minutes, (int, float)) and not isinstance(minutes, bool) and minutes >= 0:
             cfg['midi_idle_reopen_minutes'] = minutes
+        cfg['keepalive'] = normalize_keepalive(stored.get('keepalive'))
     with state_lock:
         config = cfg
         refresh_assigned_apps()
@@ -1140,6 +1226,110 @@ class MediaControl:
             return []
 
 
+class KeepAlive:
+    """Plays the keep-alive burst on the default output device. Owns
+    sounddevice/PortAudio completely - it is imported and used only in this
+    thread, so it never meets the COM setup of the audio or the UI thread."""
+
+    def __init__(self):
+        self.wake = threading.Event()
+        self.locked = False
+        self.test_settings = None
+        self.sd = None
+        self.tone_key = None
+        self.tone = b''
+
+    # -- called from other threads --
+
+    def settings_changed(self):
+        self.wake.set()
+
+    def set_locked(self, locked):
+        if locked != self.locked:
+            self.locked = locked
+            log.info("session %s", "locked" if locked else "unlocked")
+            self.wake.set()
+
+    def test(self, settings):
+        """Play one burst with these (unsaved) settings right away."""
+        self.test_settings = dict(settings)
+        self.wake.set()
+
+    # -- keep-alive thread --
+
+    def _set_status(self, text):
+        with state_lock:
+            changed = runtime['keepalive_status'] != text
+            runtime['keepalive_status'] = text
+        if changed:
+            notify_ui()
+
+    def _play(self, settings):
+        key = tuple(sorted(settings.items()))
+        if key != self.tone_key:
+            self.tone = build_keepalive_tone(settings)
+            self.tone_key = key
+        if self.sd is None:
+            import sounddevice
+            self.sd = sounddevice
+        for attempt in (1, 2):
+            try:
+                with self.sd.RawOutputStream(samplerate=settings['sample_rate'],
+                                             channels=1, dtype='float32') as stream:
+                    stream.write(self.tone)
+                return
+            except Exception:
+                if attempt == 2:
+                    raise
+                # The device list PortAudio read at start may be outdated
+                # (default device unplugged): re-initialise once and retry.
+                try:
+                    self.sd._terminate()
+                    self.sd._initialize()
+                except Exception:
+                    pass
+
+    def _safe_play(self, settings, what):
+        try:
+            self._play(settings)
+        except Exception as err:
+            throttled.problem('keepalive', "keep-alive %s failed: %r", what, err)
+            self._set_status("error: %s" % err)
+            return False
+        throttled.ok('keepalive', "keep-alive playing again")
+        return True
+
+    def run(self):
+        last_burst = None             # monotonic start of the last burst
+        while not shutdown.is_set():
+            heartbeat('keepalive')
+            test, self.test_settings = self.test_settings, None
+            if test is not None:
+                self._safe_play(test, "test")
+
+            with state_lock:
+                settings = dict(config['keepalive'])
+            paused = settings['pause_when_locked'] and self.locked
+            if not settings['enabled'] or paused:
+                # Re-activation starts with a burst right away.
+                last_burst = None
+                self._set_status("paused (PC locked)" if settings['enabled'] else "off")
+                timeout = 30.0
+            else:
+                interval = settings['interval_minutes'] * 60
+                now = time.monotonic()
+                if last_burst is None or now - last_burst >= interval:
+                    last_burst = now
+                    if self._safe_play(settings, "burst"):
+                        log.debug("keep-alive burst played")
+                        self._set_status("active, last burst %s" % time.strftime('%H:%M'))
+                timeout = max(0.0, last_burst + interval - time.monotonic())
+            # Sleep until the next burst or a settings change; wake at least
+            # every 30 s only to tell the watchdog this thread is alive.
+            self.wake.wait(min(timeout, 30.0))
+            self.wake.clear()
+
+
 # --- Threads, watchdog -------------------------------------------------------
 
 def start_supervised(name, target):
@@ -1241,9 +1431,10 @@ def run_ui():
     global notify_ui
     from PySide6.QtCore import QObject, Qt, QTimer, Signal
     from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPixmap
-    from PySide6.QtWidgets import (QApplication, QComboBox, QGridLayout, QHBoxLayout,
-                                   QInputDialog, QLabel, QMenu, QMessageBox, QPushButton,
-                                   QScrollArea, QSystemTrayIcon, QVBoxLayout, QWidget)
+    from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDoubleSpinBox,
+                                   QFormLayout, QGridLayout, QHBoxLayout, QInputDialog,
+                                   QLabel, QMenu, QMessageBox, QPushButton, QScrollArea,
+                                   QSystemTrayIcon, QVBoxLayout, QWidget)
 
     class Bridge(QObject):
         changed = Signal()
@@ -1434,6 +1625,189 @@ def run_ui():
             audio_queue.put(('reconcile',))
             self.hide()
 
+    class KeepAliveWindow(QWidget):
+        """Settings of the speaker keep-alive. Values only take effect on
+        Save; Test plays the values as they are in the window."""
+
+        def __init__(self):
+            super().__init__()
+            self.setWindowTitle("nanoKONTROL2 – Speaker keep-alive")
+            outer = QVBoxLayout(self)
+
+            intro = QLabel("Plays a short, quiet burst on the default output device at a fixed "
+                           "interval, so that active speakers do not fall into standby.\n"
+                           "Windows master volume and mute apply to the burst as well.")
+            intro.setWordWrap(True)
+            outer.addWidget(intro)
+
+            self.enabled = QCheckBox("Keep-alive active")
+            outer.addWidget(self.enabled)
+
+            form = QFormLayout()
+            self.interval = self._spin(0.5, 240.0, 0.5, 1, " min", 'interval_minutes')
+            form.addRow("Interval (start to start)", self.interval)
+            self.duration = self._spin(0.1, 60.0, 0.1, 2, " s", 'duration_s')
+            form.addRow("Burst length", self.duration)
+            self.frequency = self._spin(10.0, 48000.0, 100.0, 0, " Hz", 'frequency_hz')
+            form.addRow("Frequency", self.frequency)
+            self.level = self._spin(-90.0, 0.0, 1.0, 1, " dBFS", 'level_dbfs')
+            form.addRow("Level (0 = full scale)", self.level)
+            self.sample_rate = QComboBox()
+            for rate in KEEPALIVE_SAMPLE_RATES:
+                self.sample_rate.addItem("%d Hz" % rate, rate)
+            form.addRow("Sample rate", self.sample_rate)
+            self.fade = self._spin(0.0, 5.0, 0.01, 3, " s", 'fade_s')
+            form.addRow("Fade in/out", self.fade)
+            outer.addLayout(form)
+
+            self.pause_locked = QCheckBox("Pause while the PC is locked")
+            outer.addWidget(self.pause_locked)
+
+            self.status = QLabel()
+            outer.addWidget(self.status)
+
+            buttons = QHBoxLayout()
+            test_button = QPushButton("Test now")
+            test_button.setToolTip("Plays one burst with the values shown, without saving them.")
+            test_button.clicked.connect(self.on_test)
+            buttons.addWidget(test_button)
+            reset_button = QPushButton("Reset to defaults")
+            reset_button.clicked.connect(lambda: self.load(KEEPALIVE_DEFAULTS))
+            buttons.addWidget(reset_button)
+            buttons.addStretch(1)
+            save_button = QPushButton("Save")
+            save_button.setDefault(True)
+            save_button.clicked.connect(self.on_save)
+            buttons.addWidget(save_button)
+            close_button = QPushButton("Close")
+            close_button.clicked.connect(self.hide)
+            buttons.addWidget(close_button)
+            outer.addLayout(buttons)
+
+        def _spin(self, low, high, step, decimals, suffix, key):
+            spin = QDoubleSpinBox()
+            spin.setRange(low, high)
+            spin.setSingleStep(step)
+            spin.setDecimals(decimals)
+            spin.setSuffix(suffix)
+            spin.setToolTip("Default: %s%s" % (KEEPALIVE_DEFAULTS[key], suffix))
+            return spin
+
+        def load(self, settings):
+            self.enabled.setChecked(settings['enabled'])
+            self.interval.setValue(settings['interval_minutes'])
+            self.duration.setValue(settings['duration_s'])
+            self.frequency.setValue(settings['frequency_hz'])
+            self.level.setValue(settings['level_dbfs'])
+            self.sample_rate.setCurrentIndex(max(0, self.sample_rate.findData(settings['sample_rate'])))
+            self.fade.setValue(settings['fade_s'])
+            self.pause_locked.setChecked(settings['pause_when_locked'])
+
+        def values(self):
+            return {
+                'enabled': self.enabled.isChecked(),
+                'interval_minutes': self.interval.value(),
+                'duration_s': self.duration.value(),
+                'frequency_hz': self.frequency.value(),
+                'level_dbfs': self.level.value(),
+                'sample_rate': int(self.sample_rate.currentData()),
+                'fade_s': self.fade.value(),
+                'pause_when_locked': self.pause_locked.isChecked(),
+            }
+
+        def reload(self):
+            with state_lock:
+                self.load(dict(config['keepalive']))
+            self.update_status()
+
+        def update_status(self):
+            with state_lock:
+                self.status.setText("Status: %s" % runtime['keepalive_status'])
+
+        def _checked_values(self):
+            values = self.values()
+            problem = keepalive_problem(values)
+            if problem:
+                QMessageBox.warning(self, "nanoKONTROL2", problem)
+                return None
+            return values
+
+        def on_test(self):
+            values = self._checked_values()
+            if values is not None and keepalive is not None:
+                keepalive.test(values)
+
+        def on_save(self):
+            values = self._checked_values()
+            if values is None:
+                return
+            save_keepalive(values, self)
+            self.hide()
+
+    def save_keepalive(values, parent=None):
+        with state_lock:
+            config['keepalive'] = normalize_keepalive(values)
+        try:
+            save_config()
+        except OSError as err:
+            QMessageBox.critical(parent, "nanoKONTROL2",
+                                 "Could not write the config:\n%s\n\n"
+                                 "The new settings are active until the next restart." % err)
+        log.info("keep-alive settings saved: %s", "active" if values['enabled'] else "off")
+        if keepalive is not None:
+            keepalive.settings_changed()
+
+    class SessionWatcher(QWidget):
+        """Invisible window that receives lock/unlock notifications from
+        Windows (WTSRegisterSessionNotification) - pushed by the system, no
+        polling. Registration is retried, because at logon the session
+        service may not answer yet."""
+
+        WM_WTSSESSION_CHANGE = 0x02B1
+        WTS_SESSION_LOCK = 0x7
+        WTS_SESSION_UNLOCK = 0x8
+
+        def __init__(self):
+            super().__init__()
+            self.attempts = 0
+            self.timer = QTimer(self)
+            self.timer.timeout.connect(self.register)
+            if IS_WINDOWS:
+                self.register()
+
+        def register(self):
+            self.attempts += 1
+            try:
+                wtsapi32 = ctypes.WinDLL('wtsapi32')
+                wtsapi32.WTSRegisterSessionNotification.argtypes = [wintypes.HWND, wintypes.DWORD]
+                wtsapi32.WTSRegisterSessionNotification.restype = wintypes.BOOL
+                ok = wtsapi32.WTSRegisterSessionNotification(int(self.winId()), 0)
+            except (OSError, AttributeError) as err:
+                ok = False
+                log.debug("WTSRegisterSessionNotification: %s", err)
+            if ok:
+                self.timer.stop()
+                log.debug("lock notifications registered")
+            elif self.attempts < 30:
+                self.timer.start(2000)
+            else:
+                self.timer.stop()
+                log.warning("lock notifications unavailable, 'pause while locked' has no effect")
+
+        def nativeEvent(self, event_type, message):
+            try:
+                raw = event_type.data() if hasattr(event_type, 'data') else bytes(event_type)
+                if raw == b'windows_generic_MSG':
+                    msg = wintypes.MSG.from_address(int(message))
+                    if msg.message == self.WM_WTSSESSION_CHANGE and keepalive is not None:
+                        if msg.wParam == self.WTS_SESSION_LOCK:
+                            keepalive.set_locked(True)
+                        elif msg.wParam == self.WTS_SESSION_UNLOCK:
+                            keepalive.set_locked(False)
+            except Exception as err:
+                log.debug("nativeEvent: %r", err)
+            return False, 0
+
     class TrayApp(QObject):
         def __init__(self, app):
             super().__init__()
@@ -1441,6 +1815,7 @@ def run_ui():
             self.icon_ok = make_icon(True)
             self.icon_bad = make_icon(False)
             self.settings_window = None
+            self.keepalive_window = None
             self.tray = QSystemTrayIcon(self.icon_bad)
             self.menu = QMenu()
             self.menu.aboutToShow.connect(self.rebuild_menu)
@@ -1464,6 +1839,8 @@ def run_ui():
             self.tray.setToolTip("nanoKONTROL2\n%s\n%s" % (midi, audio))
             if self.settings_window is not None and self.settings_window.isVisible():
                 self.settings_window.update_status()
+            if self.keepalive_window is not None and self.keepalive_window.isVisible():
+                self.keepalive_window.update_status()
 
         def rebuild_menu(self):
             self.menu.clear()
@@ -1489,7 +1866,16 @@ def run_ui():
                 self.menu.addAction("No faders assigned").setEnabled(False)
 
             self.menu.addSeparator()
+            with state_lock:
+                keepalive_on = config['keepalive']['enabled']
+            action = self.menu.addAction("Speaker keep-alive")
+            action.setCheckable(True)
+            action.setChecked(keepalive_on)
+            action.triggered.connect(self.on_keepalive_toggled)
+
+            self.menu.addSeparator()
             self.menu.addAction("Settings …").triggered.connect(self.on_settings)
+            self.menu.addAction("Keep-alive settings …").triggered.connect(self.on_keepalive_settings)
             self.menu.addAction("Rescan / reconnect devices").triggered.connect(self.on_rescan)
             self.menu.addAction("Open config folder").triggered.connect(self.on_open_folder)
             self.menu.addAction("Quit").triggered.connect(self.on_quit)
@@ -1525,6 +1911,23 @@ def run_ui():
             self.settings_window.raise_()
             self.settings_window.activateWindow()
 
+        def on_keepalive_toggled(self, checked):
+            with state_lock:
+                values = dict(config['keepalive'])
+            values['enabled'] = bool(checked)
+            save_keepalive(values)
+            if self.keepalive_window is not None and self.keepalive_window.isVisible():
+                self.keepalive_window.enabled.setChecked(bool(checked))
+
+        def on_keepalive_settings(self):
+            if self.keepalive_window is None:
+                self.keepalive_window = KeepAliveWindow()
+            if not self.keepalive_window.isVisible():
+                self.keepalive_window.reload()
+            self.keepalive_window.show()
+            self.keepalive_window.raise_()
+            self.keepalive_window.activateWindow()
+
         def on_quit(self):
             log.info("quit requested from the tray")
             shutdown.set()
@@ -1550,13 +1953,14 @@ def run_ui():
     bridge.changed.connect(tray_app.update_status)
     # Emitting a signal is thread safe; Qt delivers it on the GUI thread.
     notify_ui = bridge.changed.emit
+    tray_app.session_watcher = SessionWatcher()   # kept referenced, it owns the window
 
     # Ctrl+C in a console: Python only runs signal handlers between bytecodes,
     # the timer makes sure that happens while Qt sits in its event loop.
     signal.signal(signal.SIGINT, lambda *_: app.quit())
-    keepalive = QTimer()
-    keepalive.timeout.connect(lambda: None)
-    keepalive.start(500)
+    signal_timer = QTimer()
+    signal_timer.timeout.connect(lambda: None)
+    signal_timer.start(500)
 
     code = app.exec()
     notify_ui = lambda: None    # noqa: E731 - the bridge is about to go away
@@ -1618,7 +2022,7 @@ def message_box(text):
 
 def run_service():
     """The actual program: worker threads plus the tray."""
-    global midi_input, media
+    global midi_input, media, keepalive
     # The previous instance may still be shutting down after a restart.
     for _ in range(20):
         if acquire_mutex("Local\\nanokontrol2-windows-service"):
@@ -1643,6 +2047,8 @@ def run_service():
     start_supervised('midi', midi_input.run)
     start_supervised('media', media.run)
     start_supervised('save', save_thread)
+    keepalive = KeepAlive()
+    start_supervised('keepalive', keepalive.run)
     threading.Thread(target=watchdog_thread, name='watchdog', daemon=True).start()
 
     try:
