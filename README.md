@@ -27,6 +27,8 @@ Note that this project is purely AI-generated. Anyway, it works flawlessly on my
 - Levels and mute states survive a restart
 - Corrects applications that reset their own stream volume, event driven rather than polled
 - Reconnects on its own when PipeWire restarts
+- Optional speaker keep-alive: a short, inaudible burst at a fixed interval keeps active
+  speakers from falling into standby (off by default)
 
 ## Requirements
 
@@ -64,7 +66,8 @@ python3 nanokontrol-daemon.py
 ```bash
 # System packages
 sudo apt install playerctl python3-pip libasound2-dev pkg-config \
-                 python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1
+                 python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 \
+                 libportaudio2
 
 # Python packages
 pip install -r requirements.txt --break-system-packages
@@ -111,7 +114,9 @@ exits with an error and systemd retries every three seconds until it appears.
 Click the tray icon for the menu:
 
 - **Mute: \<target\>** — one checkbox per assigned fader, mirroring the mute state
+- **Speaker keep-alive** — switches the [keep-alive](#speaker-keep-alive) on and off
 - **Settings …** — the assignment window
+- **Keep-alive settings …** — the keep-alive window
 - **Rescan devices** — re-read devices and streams after plugging something in
 - **Quit**
 
@@ -148,6 +153,32 @@ playerctl -l
 Defaults on first start: faders 1–3 control Spotify, Firefox and Discord, fader 8 is the
 master output, knob 8 is the microphone, transport is locked to `spotify`.
 
+### Speaker keep-alive
+
+Some active speakers go into standby during quiet passages and wake up again with a crackle.
+The keep-alive plays a short burst — by default inaudible — on the default output device at a
+fixed interval, whether or not something else is playing, so they never get there. It is
+off by default and configured only in its own window (**Keep-alive settings …**):
+
+| Setting | Default | |
+| --- | --- | --- |
+| Keep-alive active | off | also the checkbox in the tray menu |
+| Interval | 10 min | from the start of one burst to the start of the next |
+| Burst length | 2 s | |
+| Frequency | 20000 Hz | must be below half the sample rate |
+| Level | −30 dBFS | 0 dBFS = full scale |
+| Sample rate | 48000 Hz | 44100, 48000, 88200 or 96000 |
+| Fade in/out | 0.05 s | avoids clicks |
+| Pause while the PC is locked | off | |
+
+**Test now** plays one burst with the values as they are in the window, without saving them
+— set e.g. 100 Hz at −40 dBFS to actually hear it. **Reset to defaults** fills in the
+defaults; nothing changes until **Save**. Switching the keep-alive on, or unlocking the PC
+with *Pause while the PC is locked*, plays the first burst right away.
+
+The burst goes through the normal output path, so the volume and mute of the output device
+apply to it as well: with the master muted, nothing reaches the speakers.
+
 ### Configuration files
 
 `~/.config/nanokontrol/config.json` — assignments, written by the settings window:
@@ -160,9 +191,22 @@ master output, knob 8 is the microphone, transport is locked to `spotify`.
     "knob7": "default_source"
   },
   "transport_player": "spotify",
-  "known_apps": ["Discord", "Firefox", "Spotify"]
+  "known_apps": ["Discord", "Firefox", "Spotify"],
+  "keepalive": {
+    "enabled": false,
+    "interval_minutes": 10.0,
+    "duration_s": 2.0,
+    "frequency_hz": 20000.0,
+    "level_dbfs": -30.0,
+    "sample_rate": 48000,
+    "fade_s": 0.05,
+    "pause_when_locked": false
+  }
 }
 ```
+
+`keepalive` is written by the keep-alive window. Missing or invalid values fall back to the
+defaults, numbers are clamped to the ranges the window allows.
 
 `~/.config/nanokontrol/state.json` — last level (MIDI value 0–127) and mute state per
 application. Device volumes are deliberately **not** stored here; the sound server already
@@ -188,6 +232,11 @@ daemon also matches against `application.process.binary`.
 
 **Transport buttons do nothing.** `playerctl -l` must list the configured player name while
 it is running. Flatpak and Snap builds sometimes register under a different bus name.
+
+**Keep-alive status says "error".** The burst is played through PortAudio
+(`libportaudio2`); the message after "error:" is PortAudio's. *Pause while the PC is
+locked* needs a desktop that reports the lock to logind (GNOME and KDE do); if it does not,
+the journal says so at startup and the keep-alive simply keeps running.
 
 ---
 
@@ -239,7 +288,10 @@ python windows\nanokontrol-windows.py --no-supervisor
 Left-click the tray icon for the settings window, right-click for the menu:
 
 - **Mute: \<target\>** — one checkbox per assigned fader, mirroring the mute state
+- **Speaker keep-alive** — switches the keep-alive on and off
 - **Settings …** — the assignment window, the same as on Linux
+- **Keep-alive settings …** — the keep-alive window, the same as on Linux, see
+  [Speaker keep-alive](#speaker-keep-alive)
 - **Rescan / reconnect devices** — forces a fresh look at MIDI and audio; normally not needed
 - **Open config folder** — config, state and log files
 - **Quit**
@@ -257,6 +309,7 @@ Differences to the Linux version:
 | Player lock | MPRIS name (`spotify`) | part of the player's app id (`Spotify`), case-insensitive |
 | Config | `~/.config/nanokontrol/` | `%APPDATA%\nanokontrol\` |
 | Autostart | systemd user service | shortcut in the Startup folder + built-in supervisor |
+| Keep-alive lock detection | logind `LockedHint` | Windows session notifications |
 
 Application names match case-insensitively and with or without `.exe`, so a config copied
 from Linux keeps working. If the player lock is empty, the transport buttons go to whatever
@@ -308,6 +361,10 @@ the settings window — running applications are marked *(playing)* — and pick
 player runs; the *Media player* list shows the app ids Windows reports. Any part of the id
 works, e.g. `Spotify` for both the desktop and the Store version.
 
+**Keep-alive status says "error".** The message after "error:" is PortAudio's (shipped with
+the `sounddevice` package). After changing the default output device the next burst
+re-initialises PortAudio on its own.
+
 **It does not start at all.** A message box points to the log. Missing packages are fixed by
 running `install.ps1` again.
 
@@ -353,15 +410,16 @@ would be a self-contained change in `set_target_volume`.
 
 ## Architecture
 
-Four threads, one process:
+Six threads, one process:
 
 | Thread | Job |
 | --- | --- |
-| main | GTK main loop, tray, settings window |
+| main | GTK main loop, tray, settings windows, logind lock signal |
 | rtmidi callback | Receives CC messages, applies them directly |
 | pulse listener | Blocks in `event_listen()` on its own connection, pushes events to a queue |
 | event worker | Drains that queue and reconciles stream state |
 | save | Debounced writes of `state.json` and the stream-restore entries |
+| keep-alive | Sleeps until the next burst or a settings change, then plays it |
 
 There are **two** PulseAudio connections. `pulsectl` is not reentrant: you cannot make API
 calls from inside an event callback on the same connection. So one connection does nothing
@@ -435,12 +493,13 @@ does not:
 
 | Thread | Job |
 | --- | --- |
-| main | Qt event loop, tray, settings window |
+| main | Qt event loop, tray, settings windows, lock notifications |
 | audio | Owns every Core Audio COM object; applies fader commands, reconciles once a second |
 | midi | Owns the WinMM port; messages arrive in its own message queue (`CALLBACK_THREAD`) |
 | media | asyncio loop for the Windows media controls |
 | save | Debounced writes of `state.json` |
 | watchdog | Detects standby (wall clock jumps) and hung threads |
+| keepalive | Plays the speaker keep-alive bursts |
 
 **Reconciling instead of event subscription.** Windows offers COM callbacks for new sessions
 and volume changes, but they run on threads of the audio service and are a common source of
@@ -473,6 +532,30 @@ exit, with back-off. A clean *Quit* ends both. Named mutexes keep a second insta
 fighting over the MIDI port. On exit, interpreter teardown is skipped (`os._exit`) after the
 state is saved, which avoids the classic crashes of COM objects being released too late.
 
+## Speaker keep-alive
+
+The feature is the same code in both scripts (deliberately duplicated, so each version stays
+a single file):
+
+- **Nothing runs between bursts.** The tone is computed once per settings change, in plain
+  Python (no numpy, ~10 ms). For a burst a PortAudio stream is opened, the tone written and
+  the stream closed again; in between no stream is open and the thread waits on an event
+  until the next burst is due or the settings change. While the keep-alive is off it waits
+  without any timeout on Linux. On Windows it wakes every 30 s, only to report to the
+  watchdog.
+- **PortAudio stays in its thread.** `sounddevice` is imported and used only in the
+  keep-alive thread, so it never meets the COM setup of the audio or UI thread on Windows.
+  It plays on PortAudio's default device (Windows: the sound mapper, Linux: ALSA `default`,
+  i.e. PipeWire/PulseAudio), which follows the system's default output. If a burst fails —
+  typically because the device list PortAudio read at start is outdated — PortAudio is
+  re-initialised once and the burst retried; a lasting error is shown as status and logged
+  once, and the thread keeps going.
+- **Lock detection is pushed, not polled.** Windows: a hidden window registered with
+  `WTSRegisterSessionNotification` receives `WM_WTSSESSION_CHANGE`. Linux: the daemon reads
+  the user's display session from logind (it runs as a user service, outside the session)
+  and subscribes to `PropertiesChanged` of its `LockedHint`. Both need the tray's event
+  loop; without it the option has no effect.
+
 ## Known limitations
 
 - Application matching is by `application.name` (falling back to
@@ -486,6 +569,9 @@ state is saved, which avoids the classic crashes of COM objects being released t
 - Linux: only tested on Ubuntu with PipeWire and GNOME. The PulseAudio API used is the
   compatibility layer, so real PulseAudio should work, but it is untested.
 - Windows: only tested on Windows 11.
+- Keep-alive: only the default output device; the device's volume and mute apply to the
+  burst. On Linux it runs only while the daemon runs, i.e. not while it waits for the
+  nanoKONTROL2 to be plugged in.
 
 ## License
 
